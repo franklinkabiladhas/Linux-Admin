@@ -1,0 +1,687 @@
+BOTH NODE:
+==========
+Installation Packages:
+----------------------
+     //DISK: /dev/cdb -> n-p-1-enter-enter-p-w-partprobe---> after Disk vdb1 created.check it lsblk
+
+     yum update -y
+     yum install -y pacemaker pcs psmisc policycoreutils-python
+     rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org
+     rpm -Uvh http://www.elrepo.org/elrepo-release-7.0-2.el7.elrepo.noarch.rpm
+     yum install -y kmod-drbd84 drbd84-utils
+     yum install httpd mariadb mariadb-server php
+
+WebServer Status:
+----------------- 
+# vim /etc/httpd/conf.d/status.conf
+     <Location /server-status>
+     SetHandler server-status
+     Require local
+     </Location>
+
+scp /etc/httpd/conf.d/status.conf root@n2:/etc/httpd/conf.d/status.conf
+
+Disable Security: For Testing Purpose:
+--------------------------------------
+     setenforce 0
+     systemctl stop firewalld
+     systemctl disable firewalld
+     (or)
+If Firewall is active:
+``````````````````````
+     firewall-cmd --permanent  --add-rich-rule='rule family=ipv4 source address=192.168.122.0/24 accept' 
+     firewall-cmd --reload
+     modprobe drbd
+
+DRBD Configuration:
+-------------------
+
+vim /etc/drbd.d/clusterdb.res
+     
+resource clusterdb {
+  protocol C;
+  handlers {
+    pri-on-incon-degr "/usr/lib/drbd/notify-pri-on-incon-degr.sh; /usr/lib/drbd/notifyemergency-reboot.sh; echo b > /proc/sysrq-trigger ; reboot -f";
+    pri-lost-after-sb "/usr/lib/drbd/notify-pri-lost-after-sb.sh; /usr/lib/drbd/notifyemergency-reboot.sh; echo b > /proc/sysrq-trigger; reboot -f";
+    local-io-error "/usr/lib/drbd/notify-io-error.sh; /usr/lib/drbd/notify-emergencyshutdown.sh; echo o > /proc/sysrq-trigger ; halt -f";
+    fence-peer "/usr/lib/drbd/crm-fence-peer.sh";
+    split-brain "/usr/lib/drbd/notify-split-brain.sh admin@acme.com";
+    out-of-sync "/usr/lib/drbd/notify-out-of-sync.sh admin@acme.com";
+  }
+  startup {
+    degr-wfc-timeout 120; # 2 minutes.
+    outdated-wfc-timeout 2; # 2 seconds.
+  }
+  disk {
+    on-io-error detach;
+  }
+  net {
+   cram-hmac-alg "sha1";
+   shared-secret "clusterdb";
+   after-sb-0pri disconnect;
+   after-sb-1pri disconnect;
+   after-sb-2pri disconnect;
+   rr-conflict disconnect;
+
+  }
+  syncer {
+   rate 150M;
+   al-extents 257; #Also Linbit told me so personally. The recommended range for this should be between 7 and 3833. The default value is 127
+   on-no-data-accessible io-error;
+  }
+  on node1 {
+    device /dev/drbd0;
+    disk /dev/sdb1;
+    address 192.168.88.135:7788;
+    flexible-meta-disk internal;
+  }
+ on node2 {
+    device /dev/drbd0;
+    disk /dev/sdb1;
+    address 192.168.88.136:7788;
+    meta-disk internal;
+  }
+  }
+     
+
+scp /etc/drbd.d/clusterdb.res root@n2:/etc/drbd.d/clusterdb.res
+
+
+Formate the Disk /dev/sdb :
+-------------------------
+
+fdisk /dev/sdb
+partprob
+mkfs.xfs /dev/sdb1
+
+=========Error===========
+[root@node01 ~]# mkfs.xfs /dev/sdb1
+meta-data=/dev/sdb1              isize=512    agcount=4, agsize=327616 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=1        finobt=0, sparse=0
+data     =                       bsize=4096   blocks=1310464, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0 ftype=1
+log      =internal log           bsize=4096   blocks=2560, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+[root@node01 ~]# mkfs.xfs /dev/sdb1
+mkfs.xfs: /dev/sdb1 appears to contain an existing filesystem (xfs).
+mkfs.xfs: Use the -f option to force overwrite.
+[root@node01 ~]# drbdadm create-md clusterdb
+md_offset 5367656448
+al_offset 5367623680
+bm_offset 5367459840
+
+Found xfs filesystem
+     5241856 kB data area apparently used
+     5241660 kB left usable by current configuration
+
+Device size would be truncated, which
+would corrupt data and result in
+'access beyond end of device' errors.
+You need to either
+   * use external meta data (recommended)
+   * shrink that filesystem first
+   * zero out the device (destroy the filesystem)
+Operation refused.
+
+Command 'drbdmeta 0 v08 /dev/sdb1 internal create-md' terminated with exit code 40
+
+=======>>>>>>Solution:>>>>>>>
+dd if=/dev/zero of=/dev/sdb1 bs=1M count=128
+
+
+Create Disk on DRBD:
+-------------------
+     drbdadm create-md clusterdb 
+     drbdadm up clusterdb
+
+=> Starting DRBD Service 
+     systemctl start drbd
+     systemctl enable drbd
+     drbdadm -- --overwrite-data-of-peer primary clusterdb
+
+
+     mkdir /jin1
+     mkdir /jino2
+
+=======LVM Filters==========
+   
+vim /etc/lvm/lvm.conf
+   
+144   add:  filter = [ "r|/dev/vdb1|", "r|/dev/disk/*|", "r|/dev/block/*|", "a|.*|" ]
+169   edit: write_cache_state = 1 to write_cache_state = 0
+940   edit:   use_lvmetad = 1 to  use_lvmetad = 0
+   scp /etc/lvm/lvm.conf root@n2:/etc/lvm/lvm.conf
+
+##########Execute the following command to ensure that locking_type is set to 1 and that use_lvmetad is set to 0 in the /etc/lvm/lvm.conf file. This command also disables and stops any lvmetad processes immediately.
+   lvmconf --enable-halvm --services --startstopservices
+####.Rebuild the “initramfs” boot image to guarantee that the boot image will not try to activate a volume group controlled by the cluster. Update the initramfs device using the following command.
+   dracut -H -f /boot/initramfs-$(uname -r).img $(uname -r)
+   reboot
+--------------------------------------------------------------------------------------------------------------
+ 
+  #cat /proc/drbd
+  ===============>>>>>>>>>>>ERROR<<<<<<<<<<<<<<<<<<======================  
+[root@node01 ~]# cat /proc/drbd
+version: 8.4.11-1 (api:1/proto:86-101)
+GIT-hash: 66145a308421e9c124ec391a7848ac20203bb03c build by mockbuild@, 2018-04-26 12:10:42
+ 0: cs:Connected ro:Secondary/Secondary ds:UpToDate/Diskless C r-----
+    ns:0 nr:0 dw:0 dr:0 al:0 bm:0 lo:0 pe:0 ua:0 ap:0 ep:1 wo:f oos:5241660
+
+[root@node02 ~]# cat /proc/drbd
+version: 8.4.11-1 (api:1/proto:86-101)
+GIT-hash: 66145a308421e9c124ec391a7848ac20203bb03c build by mockbuild@, 2018-04-26 12:10:42
+ 0: cs:Connected ro:Secondary/Secondary ds:Diskless/UpToDate C r-----
+    ns:0 nr:0 dw:0 dr:0 al:0 bm:0 lo:0 pe:0 ua:0 ap:0 ep:1 wo:b oos:0
+
+================> Solution
+ON Node02
+dd if=/dev/zero of=/dev/sdb1 bs=1M count=128
+drbdadm --force create-md clusterdb
+
+-------------------------------------------------------------------------------------------------------------------
+
+node1# drbdadm primary --force clusterdb
+
+     systemctl start pcsd.service
+     systemctl enable pcsd.service
+     passwd hacluster
+
+
+NODE ONE:
+=========
+   pvcreate /dev/drbd0
+   vgcreate drbd-vg /dev/drbd0
+   lvcreate --name drbd-jj --size 2G drbd-vg
+   lvcreate --name drbd-jjj --size 2G drbd-vg
+   
+   Formate the Disk:
+   mkfs.xfs lvms
+(optional): vgchange -ay drbd-vg   (active Volume group)
+   
+(optional): vgchange -an drbd-vg   (Deactive Volume group)
+
+     pcs cluster auth node1 node2 -u hacluster -p .
+     pcs cluster setup --name mycluster node1 node2  
+     pcs cluster start --all
+     pcs cluster enable --all
+
+========>>>>pcs status<<<<<<<<<<<<<<<
+[root@node01 ~]# pcs status
+Cluster name: mycluster
+WARNING: no stonith devices and stonith-enabled is not false
+Stack: corosync
+Current DC: node02 (version 1.1.18-11.el7_5.3-2b07d5c5a9) - partition with quorum
+Last updated: Mon Jul 23 12:49:26 2018
+Last change: Mon Jul 23 12:48:46 2018 by hacluster via crmd on node02
+
+2 nodes configured
+0 resources configured
+
+Online: [ node01 node02 ]
+
+No resources
+
+
+Daemon Status:
+  corosync: active/enabled
+  pacemaker: active/enabled
+  pcsd: active/enabled
+-------------------------------------------------------------------------------
+     pcs property set stonith-enabled=false
+     pcs property set no-quorum-policy=ignore
+     
+==============>>>>>>.....pcs status<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+[root@node01 ~]# pcs status
+Cluster name: mycluster
+Stack: corosync
+Current DC: node02 (version 1.1.18-11.el7_5.3-2b07d5c5a9) - partition with quorum
+Last updated: Mon Jul 23 12:50:39 2018
+Last change: Mon Jul 23 12:50:35 2018 by root via cibadmin on node01
+
+2 nodes configured
+0 resources configured
+
+Online: [ node01 node02 ]
+
+No resources
+
+
+Daemon Status:
+  corosync: active/enabled
+  pacemaker: active/enabled
+  pcsd: active/enabled
+-------------------------------------------------------------------     
+     pcs cluster cib drbd_cfg
+     pcs -f drbd_cfg resource create drbd_clusterdb ocf:linbit:drbd drbd_resource=clusterdb
+     pcs -f drbd_cfg resource master drbd_clusterdb_clone drbd_clusterdb master-max=1 master-node-max=1 clone-max=2 clone-node-max=1 notify=true
+     pcs cluster cib-push drbd_cfg
+==============>>>>>>.....pcs status<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+[root@node01 ~]# pcs status
+Cluster name: mycluster
+Stack: corosync
+Current DC: node02 (version 1.1.18-11.el7_5.3-2b07d5c5a9) - partition with quorum
+Last updated: Mon Jul 23 12:53:54 2018
+Last change: Mon Jul 23 12:53:23 2018 by root via cibadmin on node01
+
+2 nodes configured
+2 resources configured
+
+Online: [ node01 node02 ]
+
+Full list of resources:
+
+ Master/Slave Set: drbd_clusterdb_clone [drbd_clusterdb]
+     Masters: [ node01 ]
+     Slaves: [ node02 ]
+
+Daemon Status:
+  corosync: active/enabled
+  pacemaker: active/enabled
+  pcsd: active/enabled
+[root@node01 ~]# df -h
+Filesystem               Size  Used Avail Use% Mounted on
+/dev/mapper/centos-root   17G  1.4G   16G   9% /
+devtmpfs                 476M     0  476M   0% /dev
+tmpfs                    488M   38M  450M   8% /dev/shm
+tmpfs                    488M  7.7M  480M   2% /run
+tmpfs                    488M     0  488M   0% /sys/fs/cgroup
+/dev/sda1               1014M  159M  856M  16% /boot
+tmpfs                     98M     0   98M   0% /run/user/0
+[root@node01 ~]# cat /proc/drbd
+version: 8.4.11-1 (api:1/proto:86-101)
+GIT-hash: 66145a308421e9c124ec391a7848ac20203bb03c build by mockbuild@, 2018-04-26 12:10:42
+ 0: cs:Connected ro:Primary/Secondary ds:UpToDate/UpToDate C r-----
+    ns:5241728 nr:0 dw:68 dr:5250824 al:2 bm:0 lo:0 pe:0 ua:0 ap:0 ep:1 wo:f oos:0
+
+--------------------------------------------------------------------------------------
+ Adding LVM:
+``````````````    
+     pcs resource create lvm ocf:heartbeat:LVM volgrpname=drbd-vg
+     pcs resource create webfsone Filesystem device="/dev/drbd-vg/drbd-web" directory="/web" fstype="xfs"
+     pcs resource create webfstwo Filesystem device="/dev/drbd-vg/drbd-db" directory="/db" fstype="xfs"
+===================================error===============================================
+[root@node01 ~]# pcs resource create webfsone Filesystem device="/dev/drbd-vg/drbd-web" directory="/web" fstype="xfs"
+Assumed agent name 'ocf:heartbeat:Filesystem' (deduced from 'Filesystem')
+[root@node01 ~]#      pcs resource create webfstwo Filesystem device="/dev/drbd-vg/drbd-db" directory="/db" fstype="xfs"
+Assumed agent name 'ocf:heartbeat:Filesystem' (deduced from 'Filesystem')
+[root@node01 ~]# pcs status
+Cluster name: mycluster
+Stack: corosync
+Current DC: node02 (version 1.1.18-11.el7_5.3-2b07d5c5a9) - partition with quorum
+Last updated: Mon Jul 23 12:57:41 2018
+Last change: Mon Jul 23 12:57:37 2018 by root via cibadmin on node01
+
+2 nodes configured
+5 resources configured
+
+Online: [ node01 node02 ]
+
+Full list of resources:
+
+ Master/Slave Set: drbd_clusterdb_clone [drbd_clusterdb]
+     Masters: [ node01 ]
+     Slaves: [ node02 ]
+ lvm    (ocf::heartbeat:LVM):   Started node01
+ webfsone       (ocf::heartbeat:Filesystem):    Stopped
+ webfstwo       (ocf::heartbeat:Filesystem):    Stopped
+
+Failed Actions:
+* webfsone_start_0 on node01 'unknown error' (1): call=17, status=complete, exitreason='Couldn't mount filesystem /dev/drbd-vg/drbd-web on /web',
+    last-rc-change='Mon Jul 23 12:57:25 2018', queued=0ms, exec=192ms
+* webfstwo_start_0 on node01 'unknown error' (1): call=23, status=complete, exitreason='Couldn't mount filesystem /dev/drbd-vg/drbd-db on /db',
+    last-rc-change='Mon Jul 23 12:57:38 2018', queued=0ms, exec=152ms
+* webfsone_start_0 on node02 'not installed' (5): call=16, status=complete, exitreason='Couldn't find device [/dev/drbd-vg/drbd-web]. Expected /dev/??? to exist',
+    last-rc-change='Mon Jul 23 12:57:00 2018', queued=0ms, exec=179ms
+* webfstwo_start_0 on node02 'not installed' (5): call=22, status=complete, exitreason='Couldn't find device [/dev/drbd-vg/drbd-db]. Expected /dev/??? to exist',
+    last-rc-change='Mon Jul 23 12:57:13 2018', queued=0ms, exec=175ms
+
+
+Daemon Status:
+  corosync: active/enabled
+  pacemaker: active/enabled
+  pcsd: active/enabled
+
+root cause:
+```````````
+[root@node01 ~]# lvs
+  LV       VG      Attr       LSize   Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  root     centos  -wi-ao---- <17.00g
+  swap     centos  -wi-ao----   2.00g
+  drbd-db  drbd-vg -wi-a-----   2.00g
+  drbd-web drbd-vg -wi-a-----   2.00g
+[root@node01 ~]# lvscan
+  ACTIVE            '/dev/centos/swap' [2.00 GiB] inherit
+  ACTIVE            '/dev/centos/root' [<17.00 GiB] inherit
+  ACTIVE            '/dev/drbd-vg/drbd-web' [2.00 GiB] inherit
+  ACTIVE            '/dev/drbd-vg/drbd-db' [2.00 GiB] inherit
+
+LVM is in active mode. This must be done with Cluster. so deactive the lvm.
+
+[root@node01 ~]# vgchange -an drbd-vg
+ 0 logical volume(s) in volume group "drbd-vg" now active
+[root@node01 ~]# pcs cluster stop --all
+node01: Stopping Cluster (pacemaker)...
+node02: Stopping Cluster (pacemaker)...
+node01: Stopping Cluster (corosync)...
+node02: Stopping Cluster (corosync)...
+[root@node01 ~]# pcs cluster start --all
+node01: Starting Cluster...
+node02: Starting Cluster...
+[root@node01 ~]# pcs status
+Cluster name: mycluster
+Stack: corosync
+Current DC: node01 (version 1.1.18-11.el7_5.3-2b07d5c5a9) - partition with quorum
+Last updated: Mon Jul 23 13:07:02 2018
+Last change: Mon Jul 23 12:57:37 2018 by root via cibadmin on node01
+
+2 nodes configured
+5 resources configured
+
+Online: [ node01 node02 ]
+
+Full list of resources:
+
+ Master/Slave Set: drbd_clusterdb_clone [drbd_clusterdb]
+     Masters: [ node01 ]
+     Slaves: [ node02 ]
+ lvm    (ocf::heartbeat:LVM):   Stopped
+ webfsone       (ocf::heartbeat:Filesystem):    Stopped
+ webfstwo       (ocf::heartbeat:Filesystem):    Stopped
+
+Failed Actions:
+* lvm_start_0 on node01 'unknown error' (1): call=13, status=complete, exitreason='Volume group [drbd-vg] does not exist or contains error!   Volume group "drbd-vg" not found',
+    last-rc-change='Mon Jul 23 13:02:39 2018', queued=0ms, exec=322ms
+* webfsone_start_0 on node01 'not installed' (5): call=20, status=complete, exitreason='Couldn't find device [/dev/drbd-vg/drbd-web]. Expected /dev/??? to exist',
+    last-rc-change='Mon Jul 23 13:02:40 2018', queued=0ms, exec=152ms
+* webfstwo_start_0 on node01 'not installed' (5): call=28, status=complete, exitreason='Couldn't find device [/dev/drbd-vg/drbd-db]. Expected /dev/??? to exist',
+    last-rc-change='Mon Jul 23 13:02:42 2018', queued=0ms, exec=177ms
+* lvm_start_0 on node02 'unknown error' (1): call=23, status=complete, exitreason='Volume group [drbd-vg] does not exist or contains error!   Volume group "drbd-vg" not found',
+    last-rc-change='Mon Jul 23 13:02:15 2018', queued=1ms, exec=309ms
+* webfsone_start_0 on node02 'not installed' (5): call=26, status=complete, exitreason='Couldn't find device [/dev/drbd-vg/drbd-web]. Expected /dev/??? to exist',
+    last-rc-change='Mon Jul 23 13:02:17 2018', queued=0ms, exec=141ms
+* webfstwo_start_0 on node02 'not installed' (5): call=30, status=complete, exitreason='Couldn't find device [/dev/drbd-vg/drbd-db]. Expected /dev/??? to exist',
+    last-rc-change='Mon Jul 23 13:02:18 2018', queued=0ms, exec=194ms
+
+
+Daemon Status:
+  corosync: active/enabled
+  pacemaker: active/enabled
+  pcsd: active/enabled
+
+Cause :
+------
+lvm not formatted:
+
+mkfs.xfs /dev/drbd-vg/drbd-web
+mkfs.xfs /dev/drbd-vg/drbd-db
+pcs cluster stop --all
+pcs cluster start --all
+
+--------------------------------------------------------------------------------------------------------------------------------------------
+Adding Virtual IP:
+````````````````````  
+   pcs resource create virtualip ocf:heartbeat:IPaddr2 ip=192.168.88.100 cidr_netmask=24 nic=eth0
+
+Adding HTTP service:
+````````````````````
+     pcs resource create webserver ocf:heartbeat:apache configfile=/etc/httpd/conf/httpd.conf statusurl="http://localhost/server-status"
+
+Ordering Group:
+``````````````
+     pcs resource group add clusgroup virtualip lvm webfsone webfstwo  webserver
+
+Creating Constarint:
+````````````````````
+     pcs constraint order promote drbd_clusterdb_clone then start clusgroup INFINITY
+     pcs constraint colocation add clusgroup  with master drbd_clusterdb_clone INFINITY
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>.Output<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<,
+[root@node01 ~]# pcs status
+Cluster name: mycluster
+Stack: corosync
+Current DC: node01 (version 1.1.18-11.el7_5.3-2b07d5c5a9) - partition with quorum
+Last updated: Mon Jul 23 13:28:12 2018
+Last change: Mon Jul 23 13:19:25 2018 by root via cibadmin on node01
+
+2 nodes configured
+7 resources configured
+
+Online: [ node01 node02 ]
+
+Full list of resources:
+
+ Master/Slave Set: drbd_clusterdb_clone [drbd_clusterdb]
+     Masters: [ node01 ]
+     Slaves: [ node02 ]
+ Resource Group: clusgroup
+     virtualip  (ocf::heartbeat:IPaddr2):       Started node01
+     lvm        (ocf::heartbeat:LVM):   Started node01
+     webfsone   (ocf::heartbeat:Filesystem):    Started node01
+     webfstwo   (ocf::heartbeat:Filesystem):    Started node01
+     webserver  (ocf::heartbeat:apache):        Started node01
+
+Daemon Status:
+  corosync: active/enabled
+  pacemaker: active/enabled
+  pcsd: active/enabled
+=======================================================================================================================
+Adding FTP Service:
+```````````````````
+     pcs resource create ftpserver systemd:vsftpd --group jinogroup
+----------------------------------------------------------------------------------------------------------------------
+     #mv /etc/my.cnf /db/my.cnf
+     #mkdir -p /db/data
+     #vim /db/my.cnf
+     datadir=/db/data
+     bind-address=192.168.88.100
+(or)
+     bind-address=0.0.0.0
+
+[root@node01 db]# mkdir data
+[root@node01 db]# cd ..
+[root@node01 /]# cat /etc/passwd |grep mysql
+mysql:x:27:27:MariaDB Server:/var/lib/mysql:/sbin/nologin
+[root@node01 /]# chown -R mysql.mysql /db
+[root@node01 /]# chown -R apache.apache /web
+
+
+     mysql_install_db --no-defaults --datadir=/db/data
+
+[root@node01 /]# chown -R mysql.mysql /db
+[root@node01 /]# chown -R apache.apache /web
+
+
+     pcs resource create dbserver ocf:heartbeat:mysql config="/db/my.cnf" datadir="/db/data" pid="/var/lib/mysql/mysql.pid" socket="/var/lib/mysql/mysql.sock" user="mysql" group="mysql" additional_parameters="--user=mysql" --group clusgroup
+
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>Error<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<,
+[root@node01 /]# pcs status
+Cluster name: mycluster
+Stack: corosync
+Current DC: node01 (version 1.1.18-11.el7_5.3-2b07d5c5a9) - partition with quorum
+Last updated: Mon Jul 23 14:55:32 2018
+Last change: Mon Jul 23 13:37:42 2018 by root via cibadmin on node01
+
+2 nodes configured
+8 resources configured
+
+Online: [ node01 node02 ]
+
+Full list of resources:
+
+ Master/Slave Set: drbd_clusterdb_clone [drbd_clusterdb]
+     Masters: [ node02 ]
+     Slaves: [ node01 ]
+ Resource Group: clusgroup
+     virtualip  (ocf::heartbeat:IPaddr2):       Started node02
+     lvm        (ocf::heartbeat:LVM):   Started node02
+     webfsone   (ocf::heartbeat:Filesystem):    Started node02
+     webfstwo   (ocf::heartbeat:Filesystem):    Started node02
+     webserver  (ocf::heartbeat:apache):        Started node02
+     dbserver   (ocf::heartbeat:mysql): Stopped
+
+Failed Actions:
+* dbserver_start_0 on node01 'unknown error' (1): call=47, status=complete, exitreason='MySQL server failed to start (pid=30611) (rc=0), please check your installation',
+    last-rc-change='Mon Jul 23 13:37:42 2018', queued=0ms, exec=8939ms
+* dbserver_start_0 on node02 'unknown error' (1): call=54, status=complete, exitreason='MySQL server failed to start (pid=22631) (rc=0), please check your installation',
+    last-rc-change='Mon Jul 23 13:37:39 2018', queued=0ms, exec=11191ms
+
+
+Daemon Status:
+  corosync: active/enabled
+  pacemaker: active/enabled
+  pcsd: active/enabled
+
+[ERROR] mysqld: File '/db/data/aria_log_control' not found (Errcode: 13)
+180723 15:14:42 [ERROR] mysqld: Got error 'Can't open file' when trying to use aria control file '/db/data/aria_log_control'
+
+Solution:
+--------
+
+File permission(chown -R mysql.mysql /db) should be given after the installation (mysql_install_db --no-defaults --datadir=/db/data)---
+
+-----------------------------------------------------------------------------------------------------------
+     mysql –h 192.168.0.4 –u root –p
+     GRANT ALL ON *.* TO 'root'@'%' IDENTIFIED BY 'MyDBpassword';
+     FLUSH PRIVILEGES;
+     CREATE DATABASE cluster_db;
+     
+     
+     refer:
+     http://isardvdi-the-docs-repo.readthedocs.io/en/latest/setups/ha/active_passive/
+     http://blog.zorangagic.com/2016/02/drbd.html
+     http://avid.force.com/pkb/articles/en_US/Compatibility/Troubleshooting-DRBD-on-MediaCentral#A
+     http://sheepguardingllama.com/2011/06/drbd-error-device-is-held-open-by-someone/
+===================================================================================================================================
+If you get degraded DRBD with log messages like “Split-Brain detected but unresolved, dropping connection!”, you have to manually resolve split brain situation.
+
+Possible reason for such situation
+
+    You switch all cluster nodes in standby via cluster suite (i.e. pacemaker) at the same time, so you don’t have any active drbd instance running.
+    You switch the node, which was in Secondary status in drbd last time, online.
+    You switch other nodes online
+
+Result:
+
+#/proc/drbd on the node1
+version: 8.4.0 (api:1/proto:86-100)
+GIT-hash: 28753f559ab51b549d16bcf487fe625d5919c49c build by gardner@, 2011-12-1
+2 23:52:00
+ 0: cs:StandAlone ro:Secondary/Unknown ds:UpToDate/DUnknown   r-----
+    ns:0 nr:0 dw:0 dr:0 al:0 bm:0 lo:0 pe:0 ua:0 ap:0 ep:1 wo:b oos:76
+
+#log message on the node1
+Mar  7 15:38:05 node1 kernel: block drbd0: Split-Brain detected but unresolved, dropping connection!
+cat /var/log/messages |grep "Split-Brain"
+Jul 23 16:07:15 node01 kernel: block drbd0: Split-Brain detected but unresolved, dropping connection!
+
+#/proc/drbd on the node2
+version: 8.4.0 (api:1/proto:86-100)
+GIT-hash: 28753f559ab51b549d16bcf487fe625d5919c49c build by gardner@, 2011-12-1
+2 23:52:00
+ 0: cs:StandAlone ro:Primary/Unknown ds:UpToDate/DUnknown   r-----
+    ns:0 nr:0 dw:144 dr:4205 al:5 bm:0 lo:0 pe:0 ua:0 ap:0 ep:1 wo:b oos:100
+
+Manually resolve this split brain situation
+
+Start drbd manually on both nodes
+
+Define one node as secondary and discard data on this
+
+drbdadm secondary all
+drbdadm disconnect all
+drbdadm -- --discard-my-data connect all
+
+Think about the right node to discard the data, otherwise you can lose some data
+
+Define another node as primary and connect
+
+drbdadm primary all
+drbdadm disconnect all
+drbdadm connect all
+
+Configure drbd for auto split brain resolving
+
+Place this configuration in drbd.conf on both nodes
+
+net {
+  after-sb-0pri discard-zero-changes;
+  after-sb-1pri discard-secondary;
+  after-sb-2pri disconnect;
+}
+===================================================================
+https://zeldor.biz/2011/07/drbd-masterslave-setup/
+https://www.zenoss.com/sites/default/files/zenoss-doc/7801/book/install/ha/maps/config-master.html
+
+
+# cat <<-END >/jino1/crm_logger.sh
+#!/bin/sh
+logger -t "ClusterMon-External" "${CRM_notify_node} ${CRM_notify_rsc} \
+${CRM_notify_task} ${CRM_notify_desc} ${CRM_notify_rc} \
+${CRM_notify_target_rc} ${CRM_notify_status} ${CRM_notify_recipient}";
+exit;
+END
+
+chmod 755 /jino1/crm_logger.sh
+
+pcs resource create ClusterMon-External ClusterMon user=root update=10 extra_options="-E /usr/local/bin/crm_logger.sh --watch-fencing" htmlfile=/jino1/cluster_mon.html pidfile=/var/run/crm_mon-external.pid clone
+
+
+================================================================================================================
+You can monitor the DRBD status by using one of two methods:
+``````````````````````````````````````````````````````````
+service drbd status
+cat /proc/drbd
+
+Sample output of the commands follows. These examples assume that you are running the commands on the primary (active) IBM® Netezza® host. If you run them from the standby host, the output shows the secondary status first, then the primary.
+
+[root@nzhost1 ~]# service drbd status
+drbd driver loaded OK; device status:
+version: 8.2.6 (api:88/proto:86-88)
+GIT-hash: 3e69822d3bb4920a8c1bfdf7d647169eba7d2eb4 build by root@nps22094, 2009-06-09 
+16:25:53
+m:res  cs         st                 ds                 p  mounted       fstype
+0:r1   Connected  Primary/Secondary  UpToDate/UpToDate  C  /export/home  ext3
+1:r0   Connected  Primary/Secondary  UpToDate/UpToDate  C  /nz           ext3
+[root@nzhost1 ~]# cat /proc/drbd
+version: 8.2.6 (api:88/proto:86-88)
+GIT-hash: 3e69822d3bb4920a8c1bfdf7d647169eba7d2eb4 build by root@nps22094, 2009-06-09 
+16:25:53
+ 0: cs:Connected st:Primary/Secondary ds:UpToDate/UpToDate C r---
+    ns:15068 nr:1032 dw:16100 dr:3529 al:22 bm:37 lo:0 pe:0 ua:0 ap:0 oos:0
+ 1: cs:Connected st:Primary/Secondary ds:UpToDate/UpToDate C r---
+    ns:66084648 nr:130552 dw:66215200 dr:3052965 al:23975 bm:650 lo:0 pe:0 ua:0 ap:0 oos:0copy to clipboard
+    --------------------------------------------------------------------------------------------------------------
+    
+    NOtes:
+    =====
+In the sample output, the DRBD states are one of the following values:
+Primary/Secondary
+The "healthy" state for DRBD. One device is Primary and one is Secondary.
+Secondary/Secondary
+DRBD is in a suspended or waiting mode. This usually occurs at boot time or when the nps resource group is stopped.
+Primary/Unknown
+One node is available and healthy, the other node is either down or the cable is not connected.
+Secondary/Unknown
+This is a rare case where one node is in standby, the other is either down or the cable is not connected, and DRBD cannot declare a node as the primary/active node. If the other host also shows this status, the problem is most likely in the connection between the hosts. Contact Netezza Support for assistance in troubleshooting this case.
+The common Connection State values include the following values:
+Connected
+The normal and operating state; the host is communicating with its peer.
+WFConnection
+The host is waiting for its peer node connection; usually seen when other node is rebooting.
+Standalone
+The node is functioning alone because of a lack of network connection with its peer. It does not try to reconnect. If the cluster is in this state, it means that data is not being replicated. Manual intervention is required to fix this problem.
+The common State values include the following values:
+Primary
+The primary image; local on active host.
+Secondary
+The mirror image, which receives updates from the primary; local on standby host.
+Unknown
+Always on other host; state of image is unknown.
+The common Disk State values include the following values:
+UpToDate
+The data on the image is current.
+DUnknown
+This value is an unknown data state; usually results from a broken connection.
