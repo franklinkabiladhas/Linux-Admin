@@ -1,0 +1,20 @@
+###The best utility to burn a .iso to USB drive is "dd". 
+####Insert the USB drive and open terminal (Ctrl+Alt+T)
+####better be a root (sudo -i), don't be afraid believe in yourself
+####use "fdisk -l"  to find the USB device
+####fdisk-before
+
+#fdisk -l
+
+--- So in our case its /dev/sdb
+###Make sure the USB device is unmounted
+
+#umount /dev/sdb1
+
+####Assuming the .iso file is in your current working folder, type the below command and wait for it to finish.
+
+#dd bs=4M if=ubuntu-12.04.2-server-i386.iso of=/dev/sdb
+
+
+-----ubuntu-12.04.2-server-i386.iso is your .iso file
+-----"bs=4M" is optional. Its just to make it faster
